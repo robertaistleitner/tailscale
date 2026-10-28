@@ -6,6 +6,7 @@
 package appc
 
 import (
+	"math"
 	"net/netip"
 	"strings"
 
@@ -33,8 +34,9 @@ func (e *AppConnector) ObserveDNSResponse(res []byte) error {
 	// ["example.com"] = "www.example.com".
 	var cnameChain map[string]string
 
-	// addressRecords is a list of address records found in the response.
-	var addressRecords map[string][]netip.Addr
+	// addressRecords holds the address records found in the response, by the
+	// name they answer.
+	var addressRecords map[string]*addrRecords
 
 	for {
 		h, err := p.AnswerHeader()
@@ -86,15 +88,13 @@ func (e *AppConnector) ObserveDNSResponse(res []byte) error {
 			if err != nil {
 				return err
 			}
-			addr := netip.AddrFrom4(r.A)
-			mak.Set(&addressRecords, domain, append(addressRecords[domain], addr))
+			recordsFor(&addressRecords, domain).add(netip.AddrFrom4(r.A), h.TTL)
 		case dnsmessage.TypeAAAA:
 			r, err := p.AAAAResource()
 			if err != nil {
 				return err
 			}
-			addr := netip.AddrFrom16(r.AAAA)
-			mak.Set(&addressRecords, domain, append(addressRecords[domain], addr))
+			recordsFor(&addressRecords, domain).add(netip.AddrFrom16(r.AAAA), h.TTL)
 		default:
 			if err := p.SkipAnswer(); err != nil {
 				return err
@@ -106,7 +106,7 @@ func (e *AppConnector) ObserveDNSResponse(res []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	for domain, addrs := range addressRecords {
+	for domain, rec := range addressRecords {
 		domain, isRouted := e.findRoutedDomainLocked(domain, cnameChain)
 
 		// domain and none of the CNAMEs in the chain are routed
@@ -117,16 +117,53 @@ func (e *AppConnector) ObserveDNSResponse(res []byte) error {
 		// advertise each address we have learned for the routed domain, that
 		// was not already known.
 		var toAdvertise []netip.Prefix
-		for _, addr := range addrs {
+		for _, addr := range rec.addrs {
 			if !e.isAddrKnownLocked(domain, addr) {
 				toAdvertise = append(toAdvertise, netip.PrefixFrom(addr, addr.BitLen()))
+				// The resolution is recorded once the route is advertised,
+				// in scheduleAdvertisement, so that we never hold an expiry
+				// for an address we aren't tracking.
+				continue
 			}
+			e.noteAddrResolvedLocked(domain, addr, rec.ttl)
 		}
 
 		if len(toAdvertise) > 0 {
 			e.logf("[v2] observed new routes for %s: %s", domain, toAdvertise)
-			e.scheduleAdvertisement(domain, toAdvertise...)
+			e.scheduleAdvertisement(domain, rec.ttl, toAdvertise...)
 		}
 	}
 	return nil
+}
+
+// addrRecords are the address records a DNS response returned for one name.
+type addrRecords struct {
+	// addrs are the addresses the records resolved to.
+	addrs []netip.Addr
+
+	// ttl is the smallest TTL, in seconds, of the records addrs came from. All
+	// the records in an RRset share a TTL, so it only differs between a name's
+	// A and AAAA records.
+	//
+	// It is the TTL of the address records themselves, not of the CNAME chain
+	// that may lead to them, so a short-lived CNAME pointing at a long-lived
+	// address yields the longer lifetime. That errs towards keeping a route
+	// longer than strictly needed, which is the safe direction.
+	ttl uint32
+}
+
+// add records that the name resolved to addr in a record with the given TTL.
+func (r *addrRecords) add(addr netip.Addr, ttl uint32) {
+	r.addrs = append(r.addrs, addr)
+	r.ttl = min(r.ttl, ttl)
+}
+
+// recordsFor returns the [addrRecords] for domain in m, adding one if needed.
+func recordsFor(m *map[string]*addrRecords, domain string) *addrRecords {
+	if r, ok := (*m)[domain]; ok {
+		return r
+	}
+	r := &addrRecords{ttl: math.MaxUint32}
+	mak.Set(m, domain, r)
+	return r
 }

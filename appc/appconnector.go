@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"tailscale.com/syncs"
+	"tailscale.com/tstime"
 	"tailscale.com/types/appctype"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/views"
@@ -26,6 +27,7 @@ import (
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/execqueue"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
 	"tailscale.com/util/slicesx"
 )
@@ -139,6 +141,19 @@ type AppConnector struct {
 	// persisted route information.
 	hasStoredRoutes bool
 
+	// clock is the time source used for route expiry.
+	clock tstime.Clock
+
+	// routeMinAge and routeMaxAge bound how long a DNS-discovered address is
+	// kept after the last time a configured domain was observed resolving to
+	// it; see expiryForTTL. A zero routeMaxAge disables expiry, and discovered
+	// routes are advertised until their domain is unconfigured.
+	routeMinAge, routeMaxAge time.Duration
+
+	// stopExpiry stops the background route expiry loop. It is nil if
+	// routeMaxAge is zero.
+	stopExpiry context.CancelFunc
+
 	// mu guards the fields that follow
 	mu syncs.Mutex
 
@@ -151,6 +166,26 @@ type AppConnector struct {
 
 	// wildcards is the list of domain strings that match subdomains.
 	wildcards []string
+
+	// explicit is the set of domains in domains that were configured by name,
+	// as opposed to only being tracked because they match a wildcard. It is
+	// not persisted, so it is empty from startup until the first updateDomains.
+	explicit set.Set[string]
+
+	// expires records, for each domain in domains, when each of that domain's
+	// addresses stops being advertised unless the domain resolves to it again.
+	// It is only populated when routeMaxAge is positive, and holds an entry for
+	// exactly the addresses recorded in domains.
+	expires map[string]map[netip.Addr]time.Time
+
+	// lastExpireScan is when expireRoutes last ran, used to notice that the
+	// system clock jumped rather than that time really passed.
+	lastExpireScan time.Time
+
+	// expiresDirty records that expires changed since it was last stored.
+	// Refreshing the expiry of a known address doesn't store on its own, to
+	// keep DNS traffic from driving the write rate; expireRoutes stores it.
+	expiresDirty bool
 
 	// queue provides ordering for update operations
 	queue execqueue.ExecQueue
@@ -178,6 +213,21 @@ type Config struct {
 
 	// HasStoredRoutes indicates that the connector should assume stored routes.
 	HasStoredRoutes bool
+
+	// RouteMinAge and RouteMaxAge bound how long an address discovered by
+	// observing DNS responses continues to be advertised after the last time a
+	// configured domain was seen resolving to it. Within those bounds the
+	// retention is derived from the TTL of the records the address was learned
+	// from, so that a domain is given a generous number of chances to resolve
+	// to the address again before its route is withdrawn. See expiryForTTL.
+	//
+	// Once the retention elapses the route is withdrawn, unless some other
+	// configured domain still resolves to the same address. If RouteMaxAge is
+	// zero, discovered routes never expire and RouteMinAge is ignored.
+	RouteMinAge, RouteMaxAge time.Duration
+
+	// Clock, if non-nil, is used instead of the system clock. For tests.
+	Clock tstime.Clock
 }
 
 // NewAppConnector creates a new AppConnector.
@@ -190,6 +240,11 @@ func NewAppConnector(c Config) *AppConnector {
 	}
 	ec := c.EventBus.Client("appc.AppConnector")
 
+	clock := c.Clock
+	if clock == nil {
+		clock = tstime.StdClock{}
+	}
+
 	ac := &AppConnector{
 		logf:            logger.WithPrefix(c.Logf, "appc: "),
 		eventBus:        c.EventBus,
@@ -198,11 +253,23 @@ func NewAppConnector(c Config) *AppConnector {
 		storePub:        eventbus.Publish[appctype.RouteInfo](ec),
 		routeAdvertiser: c.RouteAdvertiser,
 		hasStoredRoutes: c.HasStoredRoutes,
+		clock:           clock,
+		routeMaxAge:     max(c.RouteMaxAge, 0),
 	}
+	ac.routeMinAge = min(max(c.RouteMinAge, 0), ac.routeMaxAge)
 	if c.RouteInfo != nil {
 		ac.domains = c.RouteInfo.Domains
 		ac.wildcards = c.RouteInfo.Wildcards
 		ac.controlRoutes = c.RouteInfo.Control
+		ac.expires = c.RouteInfo.Expires
+	}
+	if ac.routeMaxAge > 0 {
+		ac.restoreExpiresLocked()
+		ac.lastExpireScan = ac.now()
+	} else {
+		// Expiry is off, so the recorded expiries are dead weight; dropping
+		// them also keeps them from being persisted back out.
+		ac.expires = nil
 	}
 	ac.writeRateMinute = newRateLogger(time.Now, time.Minute, func(c int64, s time.Time, ln int64) {
 		ac.logf("routeInfo write rate: %d in minute starting at %v (%d routes)", c, s, ln)
@@ -211,6 +278,14 @@ func NewAppConnector(c Config) *AppConnector {
 	ac.writeRateDay = newRateLogger(time.Now, 24*time.Hour, func(c int64, s time.Time, ln int64) {
 		ac.logf("routeInfo write rate: %d in 24 hours starting at %v (%d routes)", c, s, ln)
 	})
+
+	// Started last: expireRoutes reaches the fields above, so they must all be
+	// assigned before the loop can run.
+	if ac.routeMaxAge > 0 {
+		ctx, cancel := context.WithCancel(context.Background())
+		ac.stopExpiry = cancel
+		go ac.expireLoop(ctx)
+	}
 	return ac
 }
 
@@ -226,14 +301,24 @@ func (e *AppConnector) storeRoutesLocked() {
 		for _, rs := range e.domains {
 			numRoutes += int64(len(rs))
 		}
+		e.expiresDirty = false
 		e.writeRateMinute.update(numRoutes)
 		e.writeRateDay.update(numRoutes)
+
+		var expires map[string]map[netip.Addr]time.Time
+		if len(e.expires) > 0 {
+			expires = make(map[string]map[netip.Addr]time.Time, len(e.expires))
+			for d, m := range e.expires {
+				expires[d] = maps.Clone(m)
+			}
+		}
 
 		e.storePub.Publish(appctype.RouteInfo{
 			// Clone here, as the subscriber will handle these outside our lock.
 			Control:   slices.Clone(e.controlRoutes),
 			Domains:   maps.Clone(e.domains),
 			Wildcards: slices.Clone(e.wildcards),
+			Expires:   expires,
 		})
 	}
 }
@@ -245,6 +330,8 @@ func (e *AppConnector) ClearRoutes() error {
 	e.controlRoutes = nil
 	e.domains = nil
 	e.wildcards = nil
+	e.explicit = nil
+	e.expires = nil
 	e.storeRoutesLocked()
 	return nil
 }
@@ -281,6 +368,9 @@ func (e *AppConnector) Close() {
 	if e == nil {
 		return
 	}
+	if e.stopExpiry != nil {
+		e.stopExpiry()
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.queue.Shutdown() // TODO(creachadair): Should we wait for it too?
@@ -294,6 +384,7 @@ func (e *AppConnector) updateDomains(domains []string) {
 	var oldDomains map[string][]netip.Addr
 	oldDomains, e.domains = e.domains, make(map[string][]netip.Addr, len(domains))
 	e.wildcards = e.wildcards[:0]
+	e.explicit = make(set.Set[string], len(domains))
 	for _, d := range domains {
 		d = strings.ToLower(d)
 		if len(d) == 0 {
@@ -303,6 +394,7 @@ func (e *AppConnector) updateDomains(domains []string) {
 			e.wildcards = append(e.wildcards, d[2:])
 			continue
 		}
+		e.explicit.Add(d)
 		e.domains[d] = oldDomains[d]
 		delete(oldDomains, d)
 	}
@@ -315,6 +407,13 @@ func (e *AppConnector) updateDomains(domains []string) {
 				delete(oldDomains, d)
 				break
 			}
+		}
+	}
+
+	// Forget expiries for domains we are no longer tracking.
+	for d := range e.expires {
+		if _, ok := e.domains[d]; !ok {
+			delete(e.expires, d)
 		}
 	}
 
@@ -478,8 +577,9 @@ func (e *AppConnector) isAddrKnownLocked(domain string, addr netip.Addr) bool {
 }
 
 // scheduleAdvertisement schedules an advertisement of the given address
-// associated with the given domain.
-func (e *AppConnector) scheduleAdvertisement(domain string, routes ...netip.Prefix) {
+// associated with the given domain, learned from records with the given TTL in
+// seconds.
+func (e *AppConnector) scheduleAdvertisement(domain string, ttl uint32, routes ...netip.Prefix) {
 	e.queue.Add(func() {
 		if e.routeAdvertiser != nil {
 			if err := e.routeAdvertiser.AdvertiseRoute(routes...); err != nil {
@@ -500,6 +600,7 @@ func (e *AppConnector) scheduleAdvertisement(domain string, routes ...netip.Pref
 				e.addDomainAddrLocked(domain, addr)
 				e.logf("[v2] advertised route for %v: %v", domain, addr)
 			}
+			e.noteAddrResolvedLocked(domain, addr, ttl)
 		}
 		e.storeRoutesLocked()
 	})
@@ -517,6 +618,279 @@ func (e *AppConnector) hasDomainAddrLocked(domain string, addr netip.Addr) bool 
 func (e *AppConnector) addDomainAddrLocked(domain string, addr netip.Addr) {
 	e.domains[domain] = append(e.domains[domain], addr)
 	slices.SortFunc(e.domains[domain], compareAddr)
+}
+
+// ttlExpiryFactor is how many record lifetimes an address is retained for
+// after a domain was last seen resolving to it.
+//
+// A resolver re-queries a domain at most once per TTL, so it's roughly how
+// many consecutive resolutions must come back without an address before we
+// conclude the domain no longer resolves to it. It's deliberately generous:
+// keeping a route a while longer is cheap, but withdrawing one that's still in
+// use breaks traffic until the domain is resolved again.
+const ttlExpiryFactor = 20
+
+// expiryForTTL returns how long an address learned from a record with the
+// given TTL, in seconds, is retained after a domain was last seen resolving to
+// it, bounded by routeMinAge and routeMaxAge.
+//
+// Scaling with the TTL tracks how often we can expect to see the address again
+// if it's still live: addresses behind a CDN, whose records expire in a
+// minute, are dropped soon after they fall out of rotation, while addresses
+// from long-lived records, which clients may only resolve once a week, aren't
+// withdrawn out from under them.
+func (e *AppConnector) expiryForTTL(ttl uint32) time.Duration {
+	// Compute in seconds so that an absurd TTL can't overflow a Duration.
+	if secs := int64(ttl) * ttlExpiryFactor; secs < int64(e.routeMaxAge/time.Second) {
+		return max(time.Duration(secs)*time.Second, e.routeMinAge)
+	}
+	return e.routeMaxAge
+}
+
+// now returns the current time with its monotonic clock reading stripped.
+// Expiries are persisted and compared as wall-clock times, and spotting a
+// stepped system clock in expireRoutes depends on measuring wall time too.
+func (e *AppConnector) now() time.Time { return e.clock.Now().Round(0) }
+
+// noteAddrResolvedLocked records that domain was just seen resolving to addr,
+// in a record with the given TTL in seconds, and pushes back when addr expires
+// if that doesn't happen again. It never brings an expiry forward: resolvers
+// answer from cache with whatever is left of a record's TTL, which says
+// nothing about how often the domain is resolved. It is a no-op if route
+// expiry is disabled.
+// e.mu must be held.
+func (e *AppConnector) noteAddrResolvedLocked(domain string, addr netip.Addr, ttl uint32) {
+	if e.routeMaxAge <= 0 {
+		return
+	}
+	m := e.expires[domain]
+	if m == nil {
+		m = make(map[netip.Addr]time.Time)
+		mak.Set(&e.expires, domain, m)
+	}
+	t := e.now().Add(e.expiryForTTL(ttl))
+	if !t.After(m[addr]) {
+		return
+	}
+	m[addr] = t
+	e.expiresDirty = true
+}
+
+// restoreExpiresLocked reconciles the expiries loaded from the store with
+// domains when the connector starts, so that expires holds an entry for
+// exactly the addresses in domains.
+//
+// Every address is left with at least routeMinAge to be resolved again. The
+// store doesn't say how long the node was down, during which no resolution
+// could be observed, and may be missing refreshes from shortly before it
+// stopped, so an expiry that is past or imminent isn't evidence that the
+// address is stale.
+//
+// An address with no recorded expiry, from a store written before route expiry
+// existed or by a connector that had it disabled, gets a full routeMaxAge, as
+// there is no remembered TTL to derive one from. One with an expiry further
+// out than that, written against a clock that has since been set back, is
+// brought down to it.
+// e.mu must be held.
+func (e *AppConnector) restoreExpiresLocked() {
+	now := e.now()
+	earliest, latest := now.Add(e.routeMinAge), now.Add(e.routeMaxAge)
+	for domain, addrs := range e.domains {
+		prev := e.expires[domain]
+		next := make(map[netip.Addr]time.Time, len(addrs))
+		for _, a := range addrs {
+			t, ok := prev[a]
+			switch {
+			case !ok || t.After(latest):
+				t = latest
+			case t.Before(earliest):
+				t = earliest
+			}
+			next[a] = t
+		}
+		if len(next) == 0 {
+			delete(e.expires, domain)
+			continue
+		}
+		mak.Set(&e.expires, domain, next)
+	}
+	for domain := range e.expires {
+		if _, ok := e.domains[domain]; !ok {
+			delete(e.expires, domain)
+		}
+	}
+	e.expiresDirty = true
+}
+
+// shiftExpiresLocked moves every recorded expiry by d.
+// e.mu must be held.
+func (e *AppConnector) shiftExpiresLocked(d time.Duration) {
+	for _, m := range e.expires {
+		for a, t := range m {
+			m[a] = t.Add(d)
+		}
+	}
+	e.expiresDirty = true
+}
+
+// expireInterval returns how often to scan for expired routes given that no
+// address is retained for less than minAge.
+func expireInterval(minAge time.Duration) time.Duration {
+	return min(max(minAge/8, time.Minute), time.Hour)
+}
+
+// expireLoop periodically expires discovered routes until ctx is done.
+func (e *AppConnector) expireLoop(ctx context.Context) {
+	tc, ch := e.clock.NewTicker(expireInterval(e.routeMinAge))
+	defer tc.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ch:
+			e.expireRoutes()
+		}
+	}
+}
+
+// expireRoutes drops the addresses whose expiry has passed without a
+// configured domain resolving to them again, and unadvertises the route for
+// each dropped address that no remaining domain still resolves to. It is a
+// no-op if route expiry is disabled.
+func (e *AppConnector) expireRoutes() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.routeMaxAge <= 0 {
+		return
+	}
+
+	// Expiries are absolute times, so they only mean anything if the clock has
+	// been running normally. A host without an RTC starts near the epoch and
+	// jumps forward once it syncs, and a suspended machine wakes up far ahead
+	// of where it left off; in both cases every expiry is suddenly in the past
+	// even though we never had the chance to observe a resolution. Scans run
+	// an interval apart, so when the wall clock says otherwise it was stepped,
+	// or we weren't running; either way, carry the expiries along with it
+	// rather than withdrawing every discovered route at once.
+	now := e.now()
+	if elapsed := now.Sub(e.lastExpireScan); elapsed < 0 || elapsed > 2*expireInterval(e.routeMinAge) {
+		e.logf("clock moved %v since the last scan; deferring expiry of %d domain(s) to match", elapsed, len(e.domains))
+		e.shiftExpiresLocked(elapsed)
+	}
+	e.lastExpireScan = now
+
+	// expired holds addresses dropped from at least one domain, live holds
+	// those still resolved by some domain. An address can be in both, when one
+	// domain has gone stale for it but another hasn't.
+	var expired, live set.Set[netip.Addr]
+	var changed bool
+	for domain, addrs := range e.domains {
+		at := e.expires[domain]
+		isExpired := func(a netip.Addr) bool {
+			t, ok := at[a]
+			return ok && !now.Before(t)
+		}
+		live.Make()
+		if !slices.ContainsFunc(addrs, isExpired) {
+			live.AddSlice(addrs)
+			continue
+		}
+		changed = true
+
+		kept := make([]netip.Addr, 0, len(addrs))
+		for _, a := range addrs {
+			if isExpired(a) {
+				expired.Make()
+				expired.Add(a)
+				delete(at, a)
+				continue
+			}
+			kept = append(kept, a)
+		}
+		live.AddSlice(kept)
+		if len(kept) != 0 {
+			e.domains[domain] = kept
+			continue
+		}
+		delete(e.expires, domain)
+		if !e.explicit.Contains(domain) && e.matchesWildcardLocked(domain) {
+			// The wildcard still routes the domain and the next matching
+			// lookup re-adds it, so dropping the empty entry keeps the map
+			// from growing without bound as subdomains come and go.
+			delete(e.domains, domain)
+		} else {
+			e.domains[domain] = nil
+		}
+	}
+	if !changed {
+		if e.expiresDirty {
+			// Persist the expiries refreshed since the last scan.
+			e.storeRoutesLocked()
+		}
+		return
+	}
+
+	var toRemove []netip.Prefix
+	for a := range expired.All() {
+		if live.Contains(a) {
+			// Some other configured domain still resolves to it.
+			continue
+		}
+		if slices.ContainsFunc(e.controlRoutes, func(p netip.Prefix) bool { return p.Contains(a) }) {
+			// Covered by a route from control, so we never advertised a route
+			// for the address itself and have nothing to withdraw. It was only
+			// recorded to speed up subsequent lookups.
+			continue
+		}
+		toRemove = append(toRemove, netip.PrefixFrom(a, a.BitLen()))
+	}
+	// Set iteration order is unspecified; sort so that the updates we publish
+	// are deterministic.
+	slices.SortFunc(toRemove, func(a, b netip.Prefix) int { return compareAddr(a.Addr(), b.Addr()) })
+
+	if len(toRemove) != 0 {
+		// An address newly observed for another domain may be sitting in the
+		// queue ahead of us, waiting to be advertised and recorded; from here
+		// it looks like nothing resolves to it. The queue runs in order, so by
+		// the time this callback runs any such advertisement has been
+		// recorded, and we can tell the difference.
+		e.queue.Add(func() {
+			e.mu.Lock()
+			live := make(set.Set[netip.Addr])
+			for _, addrs := range e.domains {
+				live.AddSlice(addrs)
+			}
+			e.mu.Unlock()
+
+			stillGone := slicesx.Filter(nil, toRemove, func(p netip.Prefix) bool {
+				return !live.Contains(p.Addr())
+			})
+			if len(stillGone) == 0 {
+				return
+			}
+			e.logf("withdrawing %d expired route(s) no configured domain still resolves to", len(stillGone))
+			if e.routeAdvertiser != nil {
+				if err := e.routeAdvertiser.UnadvertiseRoute(stillGone...); err != nil {
+					e.logf("failed to unadvertise expired routes: %v: %v", stillGone, err)
+				}
+			}
+			e.updatePub.Publish(appctype.RouteUpdate{Unadvertise: stillGone})
+		})
+	}
+	e.storeRoutesLocked()
+}
+
+// matchesWildcardLocked reports whether domain is a subdomain of one of the
+// configured wildcards.
+// e.mu must be held.
+func (e *AppConnector) matchesWildcardLocked(domain string) bool {
+	for _, wc := range e.wildcards {
+		if dnsname.HasSuffix(domain, wc) {
+			return true
+		}
+	}
+	return false
 }
 
 func compareAddr(a, b netip.Addr) int {

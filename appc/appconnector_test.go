@@ -368,6 +368,11 @@ func TestWildcardDomains(t *testing.T) {
 
 // dnsResponse is a test helper that creates a DNS response buffer for the given domain and address
 func dnsResponse(domain, address string) []byte {
+	return dnsResponseTTL(domain, address, 0)
+}
+
+// dnsResponseTTL is dnsResponse, with an explicit record TTL in seconds.
+func dnsResponseTTL(domain, address string, ttl uint32) []byte {
 	addr := netip.MustParseAddr(address)
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{})
 	b.EnableCompression()
@@ -379,7 +384,7 @@ func dnsResponse(domain, address string) []byte {
 				Name:  dnsmessage.MustNewName(domain),
 				Type:  dnsmessage.TypeA,
 				Class: dnsmessage.ClassINET,
-				TTL:   0,
+				TTL:   ttl,
 			},
 			dnsmessage.AResource{
 				A: addr.As4(),
@@ -391,7 +396,7 @@ func dnsResponse(domain, address string) []byte {
 				Name:  dnsmessage.MustNewName(domain),
 				Type:  dnsmessage.TypeAAAA,
 				Class: dnsmessage.ClassINET,
-				TTL:   0,
+				TTL:   ttl,
 			},
 			dnsmessage.AAAAResource{
 				AAAA: addr.As16(),
