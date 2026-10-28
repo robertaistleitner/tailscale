@@ -88,6 +88,12 @@ type RouteInfo struct {
 	// Wildcards are the configured DNS lookup domains to observe. When a DNS query matches Wildcards,
 	// its result is added to Domains.
 	Wildcards []string `json:",omitempty"`
+	// Expires records, for each domain in Domains, when each of that domain's
+	// addresses stops being advertised unless the domain is seen resolving to
+	// it again. It is derived from the TTL of the DNS records the address was
+	// learned from. An address in Domains with no entry here is given a fresh
+	// expiry when the connector starts.
+	Expires map[string]map[netip.Addr]time.Time `json:",omitempty"`
 }
 
 // RouteUpdate records a set of routes that should be advertised and a set of

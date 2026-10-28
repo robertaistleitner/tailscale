@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"tailscale.com/tailcfg"
@@ -74,5 +75,28 @@ func assertEqual(t *testing.T, name string, a, b any) {
 	t.Helper()
 	if diff := cmp.Diff(a, b, addrComparer); diff != "" {
 		t.Fatalf("mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestRouteInfoExpiresRoundTrip(t *testing.T) {
+	addr := netip.MustParseAddr("192.0.2.1")
+	expiry := time.Date(2026, time.April, 8, 3, 8, 27, 0, time.UTC)
+	in := RouteInfo{
+		Domains: map[string][]netip.Addr{"example.com": {addr}},
+		Expires: map[string]map[netip.Addr]time.Time{"example.com": {addr: expiry}},
+	}
+
+	var out RouteInfo
+	must.Do(json.Unmarshal(must.Get(json.Marshal(in)), &out))
+	if got, ok := out.Expires["example.com"][addr]; !ok || !got.Equal(expiry) {
+		t.Errorf("Expires[example.com][%v] = %v (ok=%v), want %v", addr, got, ok, expiry)
+	}
+
+	// Route info stored before Expires existed still decodes, leaving the
+	// addresses without an expiry for the connector to seed.
+	var old RouteInfo
+	must.Do(json.Unmarshal([]byte(`{"Domains":{"example.com":["192.0.2.1"]}}`), &old))
+	if old.Expires != nil {
+		t.Errorf("Expires: got %v, want nil", old.Expires)
 	}
 }
