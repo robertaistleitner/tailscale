@@ -135,6 +135,59 @@ func TestReserveAddressesDeduplicated(t *testing.T) {
 	}
 }
 
+// TestReserveAddressesNoLeakOnFailure checks that a magic IP isn't lost from
+// its pool when the reservation fails after the magic IP was handed out. Once
+// an address is marked in use it can only be returned via popExpired, which
+// never sees assignments that failed to be inserted, so a leak here is
+// permanent.
+func TestReserveAddressesNoLeakOnFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		v4Transit *netipx.IPSet
+	}{
+		{
+			name: "empty transit pool",
+			// An empty transit pool is reachable from config: the magic and
+			// transit pools come from independent node capabilities.
+			v4Transit: &netipx.IPSet{},
+		},
+		{
+			name:      "exhausted transit pool",
+			v4Transit: mustIPSetFromPrefix("169.254.0.0/32"),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const appName = "a"
+			c := newConn25(t.Logf).client
+			c.v4MagicIPPool = newIPPool(mustIPSetFromPrefix("100.64.0.0/24"))
+			c.v4TransitIPPool = newIPPool(tt.v4Transit)
+
+			// Reserve until the transit pool runs out, then keep going. Every
+			// failure past that point must leave the magic pool untouched.
+			var gotErr error
+			var reserved int
+			for i := range 5 {
+				dst := netip.AddrFrom4([4]byte{0, 0, 0, byte(i + 1)})
+				domain := must.Get(dnsname.ToFQDN(fmt.Sprintf("e%d.example.com.", i)))
+				if _, err := c.reserveAddresses(appName, domain, dst, 10); err != nil {
+					gotErr = err
+				} else {
+					reserved++
+				}
+			}
+			if !errors.Is(gotErr, errPoolExhausted) {
+				t.Fatalf("want errPoolExhausted from the transit pool, got %v", gotErr)
+			}
+			if got := c.v4MagicIPPool.inUseCount(); got != int64(reserved) {
+				t.Errorf("magic pool has %d addresses in use, want %d (one per successful reservation)", got, reserved)
+			}
+			if got := c.v4TransitIPPool.inUseCount(); got != int64(reserved) {
+				t.Errorf("transit pool has %d addresses in use, want %d (one per successful reservation)", got, reserved)
+			}
+		})
+	}
+}
+
 func TestTransitIPConnMapping(t *testing.T) {
 	conn25 := newConn25(t.Logf)
 
